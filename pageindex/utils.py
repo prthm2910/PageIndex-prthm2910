@@ -1,3 +1,6 @@
+import random
+import re
+import threading
 import litellm
 import logging
 import os
@@ -23,10 +26,179 @@ if not os.getenv("OPENAI_API_KEY") and os.getenv("CHATGPT_API_KEY"):
 
 litellm.drop_params = True
 
+# Global concurrency and Rate Limiting settings
+# No defaults — callers must configure via set_concurrency_limit() / set_rpm_limit()
+# or pass values to page_index(). The config.yaml file provides repo defaults.
+_concurrency_limit = None
+_semaphores = {}
+_rpm_limit = None
+_rate_limiter = None
+
+class SlidingWindowRateLimiter:
+    """Sliding-window log rate limiter.
+
+    Tracks request timestamps across a 60-second window and enforces
+    a minimum spacing between consecutive requests to prevent bursts.
+    """
+    def __init__(self, requests_per_minute):
+        self.requests_per_minute = requests_per_minute
+        self.request_times = []
+        self.lock = threading.Lock()
+
+    def _wait_time(self):
+        with self.lock:
+            now = time.time()
+            self.request_times = [t for t in self.request_times if now - t < 60.0]
+
+            min_spacing = 60.0 / self.requests_per_minute if self.requests_per_minute > 0 else 0
+
+            if self.request_times:
+                last_scheduled = self.request_times[-1]
+                earliest_start = last_scheduled + min_spacing
+            else:
+                earliest_start = now
+
+            if len(self.request_times) < self.requests_per_minute:
+                scheduled_time = max(now, earliest_start)
+                self.request_times.append(scheduled_time)
+                return max(0.0, scheduled_time - now)
+
+            oldest = self.request_times[0]
+            window_wait = 60.0 - (now - oldest)
+            scheduled_time = max(now + window_wait, earliest_start)
+            self.request_times.append(scheduled_time)
+            return max(0.0, scheduled_time - now)
+
+    def wait_sync(self):
+        if self.requests_per_minute <= 0:
+            return
+        wait_t = self._wait_time()
+        if wait_t > 0:
+            time.sleep(wait_t)
+
+    async def wait_async(self):
+        if self.requests_per_minute <= 0:
+            return
+        wait_t = self._wait_time()
+        if wait_t > 0:
+            await asyncio.sleep(wait_t)
+
+def set_concurrency_limit(limit):
+    global _concurrency_limit
+    if limit is not None:
+        _concurrency_limit = limit
+
+def set_rpm_limit(limit):
+    global _rpm_limit, _rate_limiter
+    _rpm_limit = limit
+    if limit is not None and limit > 0:
+        _rate_limiter = SlidingWindowRateLimiter(limit)
+    else:
+        _rate_limiter = None
+
+def get_rate_limiter():
+    global _rate_limiter
+    if _rate_limiter is None and _rpm_limit is not None and _rpm_limit > 0:
+        _rate_limiter = SlidingWindowRateLimiter(_rpm_limit)
+    return _rate_limiter
+
+def get_llm_semaphore():
+    if _concurrency_limit is None or _concurrency_limit <= 0:
+        return None
+    loop = asyncio.get_running_loop()
+    if loop not in _semaphores:
+        _semaphores[loop] = asyncio.Semaphore(_concurrency_limit)
+    return _semaphores[loop]
+
 def count_tokens(text, model=None):
     if not text:
         return 0
     return litellm.token_counter(model=model, text=text)
+
+
+def _is_rate_limit_error(exception):
+    """Check if an exception is caused by a rate limit (HTTP 429)."""
+    error_str = str(exception).lower()
+    # Check for 429 status code or rate limit keywords
+    if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+        return True
+    # Check for LiteLLM RateLimitError class
+    if hasattr(litellm, "RateLimitError") and isinstance(exception, litellm.RateLimitError):
+        return True
+    return False
+
+
+def _extract_retry_headers(exception):
+    """Extract rate-limit headers from the exception if available."""
+    retry_after = None
+    reset_requests = None
+
+    # LiteLLM attaches headers to the exception or its response
+    # Check _response_headers, response_headers, or the exception args
+    for attr in ("_response_headers", "response_headers"):
+        headers = getattr(exception, attr, None)
+        if headers and isinstance(headers, dict):
+            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+            reset_requests = headers.get("x-ratelimit-reset-requests")
+            break
+
+    if not retry_after:
+        match = re.search(r"Retry-After:\s*(\d+)", str(exception))
+        if match:
+            retry_after = match.group(1)
+
+    return retry_after, reset_requests
+
+
+def _extract_retry_delay(exception, attempt):
+    """
+    Determine how long to wait before retrying after an error.
+
+    Priority:
+    1. Retry-After header from the provider (seconds or HTTP-date)
+    2. x-ratelimit-reset-requests header (estimated reset time)
+    3. Exponential backoff with jitter (fallback for non-429 errors)
+    """
+    if not _is_rate_limit_error(exception):
+        # Non-rate-limit errors: standard exponential backoff with jitter
+        delay = min(10.0, 1.0 * (1.5 ** attempt))
+        return delay + random.uniform(0.0, 0.5)
+
+    # For rate-limit errors, try to respect provider headers
+    retry_after, reset_requests = _extract_retry_headers(exception)
+
+    # 1. Retry-After header (can be seconds or HTTP-date)
+    if retry_after:
+        try:
+            # Try as integer seconds first (most common: "5", "30", "60")
+            seconds = int(retry_after)
+            # Cap and add jitter to spread retries
+            capped = min(seconds, 120)
+            return capped + random.uniform(0.0, 1.0)
+        except ValueError:
+            # Could be an HTTP-date (e.g. "Wed, 21 Oct 2026 07:28:00 GMT")
+            try:
+                from email.utils import parsedate_to_datetime
+                retry_time = parsedate_to_datetime(retry_after)
+                from datetime import datetime, timezone
+                wait = (retry_time - datetime.now(timezone.utc)).total_seconds()
+                if 0 < wait <= 120:
+                    return wait + random.uniform(0.0, 1.0)
+            except Exception:
+                pass
+
+    # 2. x-ratelimit-reset-requests (some providers send this as a duration or timestamp)
+    if reset_requests:
+        try:
+            seconds = float(reset_requests)
+            if 0 < seconds <= 120:
+                return seconds + random.uniform(0.0, 1.0)
+        except ValueError:
+            pass
+
+    # 3. Fallback: exponential backoff with jitter (headers unavailable)
+    delay = min(30.0, 5.0 * (1.5 ** attempt))  # Longer base for rate limits
+    return delay + random.uniform(0.0, 2.0)
 
 
 def llm_completion(model, prompt, chat_history=None, return_finish_reason=False):
@@ -34,12 +206,16 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
         model = model.removeprefix("litellm/")
     max_retries = 10
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
+    limiter = get_rate_limiter()
     for i in range(max_retries):
         try:
+            if limiter:
+                limiter.wait_sync()
             response = litellm.completion(
                 model=model,
                 messages=messages,
                 temperature=0,
+                num_retries=0,  # disable LiteLLM's built-in retry; we handle it ourselves
             )
             content = response.choices[0].message.content
             if return_finish_reason:
@@ -47,10 +223,12 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 return content, finish_reason
             return content
         except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
+            is_429 = _is_rate_limit_error(e)
+            logging.error(f"Error: {e}" + (" [Rate Limit Detected]" if is_429 else ""))
             if i < max_retries - 1:
-                time.sleep(1)
+                print('************* Retrying *************')
+                delay = _extract_retry_delay(e, i)
+                time.sleep(delay)
             else:
                 logging.error('Max retries reached for prompt: ' + prompt)
                 if return_finish_reason:
@@ -58,25 +236,42 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 return ""
 
 
-
 async def llm_acompletion(model, prompt):
     if model:
         model = model.removeprefix("litellm/")
     max_retries = 10
     messages = [{"role": "user", "content": prompt}]
+
+    sem = get_llm_semaphore()
+    limiter = get_rate_limiter()
+
     for i in range(max_retries):
         try:
-            response = await litellm.acompletion(
-                model=model,
-                messages=messages,
-                temperature=0,
-            )
+            if limiter:
+                await limiter.wait_async()
+            if sem is not None:
+                async with sem:
+                    response = await litellm.acompletion(
+                        model=model,
+                        messages=messages,
+                        temperature=0,
+                        num_retries=0,  # disable LiteLLM's built-in retry; we handle it ourselves
+                    )
+            else:
+                response = await litellm.acompletion(
+                    model=model,
+                    messages=messages,
+                    temperature=0,
+                    num_retries=0,
+                )
             return response.choices[0].message.content
         except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
+            is_429 = _is_rate_limit_error(e)
+            logging.error(f"Error: {e}" + (" [Rate Limit Detected]" if is_429 else ""))
             if i < max_retries - 1:
-                await asyncio.sleep(1)
+                print('************* Retrying *************')
+                delay = _extract_retry_delay(e, i)
+                await asyncio.sleep(delay)
             else:
                 logging.error('Max retries reached for prompt: ' + prompt)
                 return ""

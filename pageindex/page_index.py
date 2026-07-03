@@ -119,6 +119,8 @@ def toc_detector_single_page(content, model=None):
     response = llm_completion(model=model, prompt=prompt)
     # print('response', response)
     json_content = extract_json(response)    
+    if not json_content or 'toc_detected' not in json_content:
+        return False
     return json_content['toc_detected']
 
 
@@ -137,6 +139,8 @@ def check_if_toc_extraction_is_complete(content, toc, model=None):
     prompt = prompt + '\n Document:\n' + content + '\n Table of contents:\n' + toc
     response = llm_completion(model=model, prompt=prompt)
     json_content = extract_json(response)
+    if not json_content or 'completed' not in json_content:
+        return "no"
     return json_content['completed']
 
 
@@ -155,6 +159,8 @@ def check_if_toc_transformation_is_complete(content, toc, model=None):
     prompt = prompt + '\n Raw Table of contents:\n' + content + '\n Cleaned Table of contents:\n' + toc
     response = llm_completion(model=model, prompt=prompt)
     json_content = extract_json(response)
+    if not json_content or 'completed' not in json_content:
+        return "no"
     return json_content['completed']
 
 def extract_toc_content(content, model=None):
@@ -217,6 +223,8 @@ def detect_page_index(toc_content, model=None):
 
     response = llm_completion(model=model, prompt=prompt)
     json_content = extract_json(response)
+    if not json_content or 'page_index_given_in_toc' not in json_content:
+        return "no"
     return json_content['page_index_given_in_toc']
 
 def toc_extractor(page_list, toc_page_list, model):
@@ -296,7 +304,10 @@ def toc_transformer(toc_content, model=None):
     if_complete = check_if_toc_transformation_is_complete(toc_content, last_complete, model)
     if if_complete == "yes" and finish_reason == "finished":
         last_complete = extract_json(last_complete)
-        cleaned_response=convert_page_to_int(last_complete['table_of_contents'])
+        if not last_complete or 'table_of_contents' not in last_complete:
+            cleaned_response = []
+        else:
+            cleaned_response=convert_page_to_int(last_complete['table_of_contents'])
         return cleaned_response
     
     last_complete = get_json_content(last_complete)
@@ -332,7 +343,10 @@ def toc_transformer(toc_content, model=None):
 
     last_complete = extract_json(last_complete)
 
-    cleaned_response=convert_page_to_int(last_complete['table_of_contents'])
+    if not last_complete or 'table_of_contents' not in last_complete:
+        cleaned_response = []
+    else:
+        cleaned_response=convert_page_to_int(last_complete['table_of_contents'])
     return cleaned_response
     
 
@@ -485,9 +499,12 @@ def add_page_number_to_toc(part, structure, model=None):
     current_json_raw = llm_completion(model=model, prompt=prompt)
     json_result = extract_json(current_json_raw)
     
-    for item in json_result:
-        if 'start' in item:
-            del item['start']
+    if isinstance(json_result, list):
+        for item in json_result:
+            if isinstance(item, dict) and 'start' in item:
+                del item['start']
+    else:
+        json_result = []
     return json_result
 
 
@@ -532,11 +549,16 @@ def generate_toc_continue(toc_content, part, model=None):
     Directly return the additional part of the final JSON structure. Do not output anything else."""
 
     prompt = prompt + '\nGiven text\n:' + part + '\nPrevious tree structure\n:' + json.dumps(toc_content, indent=2)
-    response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
-    if finish_reason == 'finished':
-        return extract_json(response)
-    else:
-        raise Exception(f'finish reason: {finish_reason}')
+    try:
+        response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
+        if finish_reason == 'finished':
+            return extract_json(response)
+        else:
+            print(f"Warning: generate_toc_continue failed with finish reason: {finish_reason}")
+            return []
+    except Exception as e:
+        print(f"Warning: generate_toc_continue encountered an exception: {e}")
+        return []
     
 ### add verify completeness
 def generate_toc_init(part, model=None):
@@ -566,12 +588,16 @@ def generate_toc_init(part, model=None):
     Directly return the final JSON structure. Do not output anything else."""
 
     prompt = prompt + '\nGiven text\n:' + part
-    response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
-
-    if finish_reason == 'finished':
-         return extract_json(response)
-    else:
-        raise Exception(f'finish reason: {finish_reason}')
+    try:
+        response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
+        if finish_reason == 'finished':
+             return extract_json(response)
+        else:
+            print(f"Warning: generate_toc_init failed with finish reason: {finish_reason}")
+            return []
+    except Exception as e:
+        print(f"Warning: generate_toc_init encountered an exception: {e}")
+        return []
 
 def process_no_toc(page_list, start_index=1, model=None, logger=None):
     page_contents=[]
@@ -753,6 +779,8 @@ async def single_toc_item_index_fixer(section_title, content, model=None):
     prompt = toc_extractor_prompt + '\nSection Title:\n' + str(section_title) + '\nDocument pages:\n' + content
     response = await llm_acompletion(model=model, prompt=prompt)
     json_content = extract_json(response)    
+    if not json_content or 'physical_index' not in json_content:
+        return None
     return convert_physical_index_to_int(json_content['physical_index'])
 
 
@@ -994,7 +1022,11 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
         elif mode == 'process_toc_no_page_numbers':
             return await meta_processor(page_list, mode='process_no_toc', start_index=start_index, opt=opt, logger=logger)
         else:
-            raise Exception('Processing failed')
+            if logger:
+                logger.error('Processing failed, returning empty list as fallback.')
+            else:
+                print('Processing failed, returning empty list as fallback.')
+            return []
         
  
 async def process_large_node_recursively(node, page_list, opt=None, logger=None):
@@ -1111,13 +1143,19 @@ def page_index_main(doc, opt=None):
 
 
 def page_index(doc, model=None, toc_check_page_num=None, max_page_num_each_node=None, max_token_num_each_node=None,
-               if_add_node_id=None, if_add_node_summary=None, if_add_doc_description=None, if_add_node_text=None):
+               if_add_node_id=None, if_add_node_summary=None, if_add_doc_description=None, if_add_node_text=None,
+               max_concurrent_requests=None, rpm_limit=None):
     
     user_opt = {
         arg: value for arg, value in locals().items()
         if arg != "doc" and value is not None
     }
     opt = ConfigLoader().load(user_opt)
+    
+    from .utils import set_concurrency_limit, set_rpm_limit
+    set_concurrency_limit(opt.max_concurrent_requests)
+    set_rpm_limit(opt.rpm_limit)
+    
     return page_index_main(doc, opt)
 
 
