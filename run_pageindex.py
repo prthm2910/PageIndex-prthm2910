@@ -28,6 +28,10 @@ if __name__ == "__main__":
                       help='Whether to add doc description to the doc')
     parser.add_argument('--if-add-node-text', type=str, default=None,
                       help='Whether to add text to the node')
+    parser.add_argument('--rpm-limit', type=int, default=None,
+                      help='Rate limit in requests per minute (RPM)')
+    parser.add_argument('--max-concurrent-requests', type=int, default=None,
+                      help='Max concurrent API requests (0 = unlimited)')
                       
     # Markdown specific arguments
     parser.add_argument('--if-thinning', type=str, default='no',
@@ -61,8 +65,15 @@ if __name__ == "__main__":
             'if_add_node_summary': args.if_add_node_summary,
             'if_add_doc_description': args.if_add_doc_description,
             'if_add_node_text': args.if_add_node_text,
+            'rpm_limit': args.rpm_limit,
+            'max_concurrent_requests': args.max_concurrent_requests,
         }
         opt = ConfigLoader().load({k: v for k, v in user_opt.items() if v is not None})
+
+        # Apply rate limiting settings
+        from pageindex.utils import set_concurrency_limit, set_rpm_limit
+        set_concurrency_limit(opt.max_concurrent_requests)
+        set_rpm_limit(opt.rpm_limit)
 
         # Process the PDF
         toc_with_page_number = page_index_main(args.pdf_path, opt)
@@ -102,11 +113,18 @@ if __name__ == "__main__":
             'if_add_node_summary': args.if_add_node_summary,
             'if_add_doc_description': args.if_add_doc_description,
             'if_add_node_text': args.if_add_node_text,
-            'if_add_node_id': args.if_add_node_id
+            'if_add_node_id': args.if_add_node_id,
+            'rpm_limit': args.rpm_limit,
+            'max_concurrent_requests': args.max_concurrent_requests,
         }
-        
+
         # Load config with defaults from config.yaml
-        opt = config_loader.load(user_opt)
+        opt = config_loader.load({k: v for k, v in user_opt.items() if v is not None})
+
+        # Apply rate limiting settings for markdown as well
+        from pageindex.utils import set_concurrency_limit, set_rpm_limit
+        set_concurrency_limit(opt.max_concurrent_requests)
+        set_rpm_limit(opt.rpm_limit)
         
         toc_with_page_number = asyncio.run(md_to_tree(
             md_path=args.md_path,
