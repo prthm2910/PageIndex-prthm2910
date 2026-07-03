@@ -8,3 +8,5 @@ if_add_node_id: "yes"
 if_add_node_summary: "yes"
 if_add_doc_description: "no"
 if_add_node_text: "no"
+max_concurrent_requests: 0  # 0 = unlimited; set >0 to cap concurrent API calls
+rpm_limit: 0  # 0 = unlimited; set >0 to rate-limit requests per minute
